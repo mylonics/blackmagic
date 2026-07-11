@@ -162,6 +162,16 @@
 
 #define ID_RP2040 0x1002U
 
+/* Cortex-M0+ private peripheral + SYSCFG registers used to quiesce interrupts around stub runs */
+#define RP_SYST_CSR              0xe000e010U
+#define RP_SYST_CSR_TICKINT      (1U << 1U)
+#define RP_NVIC_ICER             0xe000e180U
+#define RP_NVIC_ICPR             0xe000e280U
+#define RP_ICSR_PENDSVCLR        (1U << 27U)
+#define RP_ICSR_PENDSTCLR        (1U << 25U)
+#define RP_SYSCFG_PROC0_NMI_MASK 0x40004000U
+#define RP_SYSCFG_PROC1_NMI_MASK 0x40004004U
+
 typedef struct rp_priv {
 	uint16_t rom_reset_usb_boot;
 	uint32_t ssi_enabled;
@@ -189,6 +199,8 @@ static void rp_spi_config(target_s *target);
 static void rp_spi_restore(target_s *target);
 static bool rp_flash_prepare(target_s *target);
 static bool rp_flash_resume(target_s *target);
+static bool rp_flash_halt_siblings(target_s *target);
+static void rp_flash_resume_siblings(target_s *target);
 static bool rp_flash_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t length);
 static void rp_spi_read(target_s *target, uint16_t command, target_addr32_t address, void *buffer, size_t length);
 static void rp_spi_run_command(target_s *target, uint16_t command, target_addr32_t address);
@@ -259,11 +271,17 @@ static bool rp_attach(target_s *const target)
 	if (!cortexm_attach(target) || !rp_read_rom_func_table(target))
 		return false;
 
+	/* Halt the sibling core(s): probing the Flash below takes XIP away while they may be executing from it */
+	if (!rp_flash_halt_siblings(target))
+		return false;
+
 	/* Free previously loaded memory map */
 	target_mem_map_free(target);
 	rp_add_flash(target);
 	target_add_ram32(target, RP_SRAM_BASE, RP_SRAM_SIZE);
 
+	/* XIP works again, so let the siblings pick up where they left off */
+	rp_flash_resume_siblings(target);
 	return true;
 }
 
@@ -345,6 +363,14 @@ static void rp_core_select(target_s *const target)
 }
 
 /*
+ * Tracks which target_list entries rp_flash_halt_siblings() halted (bit n is
+ * the n'th list entry), so the matching resume only releases cores we stopped
+ * and never ones held halted by the user or another debug session. Halt/resume
+ * cycles are strictly nested per debug session, so file-scope state suffices.
+ */
+static uint32_t rp_halted_siblings = 0U;
+
+/*
  * A core left running while we reprogram the SPI Flash will crash the moment it
  * next fetches from XIP, taking the Flash write stub down with it. Halt all
  * sibling cores of this chip before touching the Flash. Mirrors the halt
@@ -352,41 +378,77 @@ static void rp_core_select(target_s *const target)
  */
 static bool rp_flash_halt_siblings(target_s *const target)
 {
+	rp_halted_siblings = 0U;
 	bool halted = true;
-	for (target_s *core = target_list; core && halted; core = core->next) {
+	size_t index = 0U;
+	for (target_s *core = target_list; core && halted; core = core->next, ++index) {
 		if (!rp_core_is_sibling(target, core))
 			continue;
-		/* Select the sibling's DP on the wire, request a halt, and wait for it */
+		/* Select the sibling's DP on the wire and check if it is already stopped - if so, leave it be */
 		rp_core_select(core);
+		target_halt_reason_e reason = target_halt_poll(core, NULL);
+		/* A fatal comms error frees the target list, so bail without touching anything more */
+		if (reason == TARGET_HALT_ERROR)
+			return false;
+		if (reason != TARGET_HALT_RUNNING)
+			continue;
+		/* Request a halt and wait for it */
 		target_halt_request(core);
 		platform_timeout_s timeout;
 		platform_timeout_set(&timeout, 250);
-		target_halt_reason_e reason = TARGET_HALT_RUNNING;
 		while (!platform_timeout_is_expired(&timeout) && reason == TARGET_HALT_RUNNING)
 			reason = target_halt_poll(core, NULL);
-		/* A fatal comms error frees the target list, so bail without touching anything more */
 		if (reason == TARGET_HALT_ERROR)
 			return false;
 		/* Any other non-running reason means the core is stopped, which is all we need */
 		halted = reason != TARGET_HALT_RUNNING;
-		if (!halted)
+		if (halted && index < 32U)
+			rp_halted_siblings |= 1U << index;
+		else if (!halted)
 			DEBUG_ERROR("%s: failed to halt sibling core\n", __func__);
+	}
+	/* On a halt failure, release anything we already halted so the system stays usable */
+	if (!halted) {
+		rp_flash_resume_siblings(target);
+		return false;
 	}
 	/* Re-select the DP of the core we are flashing through */
 	rp_core_select(target);
-	return halted;
+	return true;
 }
 
 /* Release the sibling cores halted by rp_flash_halt_siblings() */
 static void rp_flash_resume_siblings(target_s *const target)
 {
-	for (target_s *core = target_list; core; core = core->next) {
-		if (!rp_core_is_sibling(target, core))
+	size_t index = 0U;
+	for (target_s *core = target_list; core; core = core->next, ++index) {
+		if (index >= 32U || !(rp_halted_siblings & (1U << index)) || !rp_core_is_sibling(target, core))
 			continue;
 		rp_core_select(core);
 		target_halt_resume(core, false);
 	}
+	rp_halted_siblings = 0U;
 	rp_core_select(target);
+}
+
+/*
+ * The Flash write stub runs on this core while XIP is down, making the vector
+ * table unreachable: any exception taken during a stub call is fatal. Knock out
+ * every maskable interrupt source. No state is saved as exiting Flash mode
+ * resets the whole chip anyway.
+ */
+static void rp_flash_quiesce_interrupts(target_s *const target)
+{
+	/* Stop SysTick interrupting and drop any pended SysTick/PendSV exception */
+	const uint32_t syst_csr = target_mem32_read32(target, RP_SYST_CSR);
+	target_mem32_write32(target, RP_SYST_CSR, syst_csr & ~RP_SYST_CSR_TICKINT);
+	target_mem32_write32(target, CORTEXM_ICSR, RP_ICSR_PENDSVCLR | RP_ICSR_PENDSTCLR);
+	/* Disable and unpend all NVIC interrupt lines */
+	target_mem32_write32(target, RP_NVIC_ICER, 0xffffffffU);
+	target_mem32_write32(target, RP_NVIC_ICPR, 0xffffffffU);
+	/* Detach anything the firmware routed onto either core's NMI */
+	target_mem32_write32(target, RP_SYSCFG_PROC0_NMI_MASK, 0U);
+	target_mem32_write32(target, RP_SYSCFG_PROC1_NMI_MASK, 0U);
 }
 
 static bool rp_flash_prepare(target_s *const target)
@@ -395,13 +457,19 @@ static bool rp_flash_prepare(target_s *const target)
 	/* Halt the sibling core(s) before we take the Flash out of XIP mode they may be executing from */
 	if (!rp_flash_halt_siblings(target))
 		return false;
+	/* Prevent this core taking an exception while its vector table is unreachable during stub runs */
+	rp_flash_quiesce_interrupts(target);
 	/* Suspend the cache, come out of XIP */
 	rp_flash_connect_internal(target);
 	rp_flash_exit_xip(target);
 	/* Configure the SPI controller for our use */
 	rp_spi_config(target);
 	/* Preload the SPI Flash write stub */
-	return target_mem32_write(target, RP_SRAM_BASE, rp_flash_write_stub, sizeof(rp_flash_write_stub)) == 0;
+	if (target_mem32_write(target, RP_SRAM_BASE, rp_flash_write_stub, sizeof(rp_flash_write_stub)) == 0)
+		return true;
+	/* The stub failed to load - bring XIP back up and restart the chip so the system stays usable */
+	rp_flash_resume(target);
+	return false;
 }
 
 static bool rp_flash_resume(target_s *const target)
@@ -412,9 +480,10 @@ static bool rp_flash_resume(target_s *const target)
 	/* Flush the cache and resume XIP */
 	rp_flash_flush_cache(target);
 	rp_flash_enter_xip(target);
-	/* Release the siblings so the system reset below restarts the whole chip cleanly */
-	rp_flash_resume_siblings(target);
+	/* Reset the whole chip; a sibling still holding C_HALT sits at its reset vector through this */
 	target_mem32_write32(target, CORTEXM_AIRCR, CORTEXM_AIRCR_VECTKEY | CORTEXM_AIRCR_SYSRESETREQ);
+	/* Now release the siblings so they restart cleanly through the boot ROM */
+	rp_flash_resume_siblings(target);
 	return true;
 }
 
@@ -729,9 +798,11 @@ static bool rp_cmd_erase_sector(target_s *const target, const int argc, const ch
 
 	target_flash_s *const flash = target->flash;
 
-	bool result = true; /* catch false returns with &= */
-	result &= rp_flash_prepare(target);
-	result &= flash->erase(flash, start, length);
+	/* If preparation fails nothing may be touched: a comms error in there frees the target list */
+	if (!rp_flash_prepare(target))
+		return false;
+	bool result = flash->erase(flash, start, length);
+	/* Always resume so XIP comes back up and the siblings get released */
 	result &= rp_flash_resume(target);
 	return result;
 }

@@ -129,6 +129,8 @@
 static bool rp2350_attach(target_s *target);
 static bool rp2350_flash_prepare(target_s *target);
 static bool rp2350_flash_resume(target_s *target);
+static bool rp2350_flash_halt_siblings(target_s *target);
+static void rp2350_flash_resume_siblings(target_s *target);
 
 static bool rp2350_spi_prepare(target_s *target);
 static void rp2350_spi_resume(target_s *target);
@@ -189,10 +191,17 @@ static bool rp2350_attach(target_s *const target)
 #endif
 	}
 
+	/* Halt the sibling core(s): probing the Flash below takes XIP away while they may be executing from it */
+	if (!rp2350_flash_halt_siblings(target))
+		return false;
+
 	/* Then figure out the memory map */
 	target_mem_map_free(target);
 	target_add_ram32(target, RP2350_SRAM_BASE, RP2350_SRAM_SIZE);
 	rp2350_add_flash(target);
+
+	/* XIP works again, so let the siblings pick up where they left off */
+	rp2350_flash_resume_siblings(target);
 	return true;
 }
 
@@ -210,41 +219,65 @@ static bool rp2350_core_is_sibling(target_s *const target, target_s *const other
 }
 
 /*
+ * Tracks which target_list entries rp2350_flash_halt_siblings() halted (bit n
+ * is the n'th list entry), so the matching resume only releases cores we
+ * stopped and never ones held halted by the user or another debug session.
+ * Halt/resume cycles are strictly nested per debug session, so file-scope
+ * state suffices.
+ */
+static uint32_t rp2350_halted_siblings = 0U;
+
+/*
  * A core left running while we reprogram the Flash will crash the moment it next
  * fetches from XIP. Halt all sibling cores of this chip before touching the
  * Flash. Mirrors the halt sequence used by cortexm_attach().
  */
 static bool rp2350_flash_halt_siblings(target_s *const target)
 {
+	rp2350_halted_siblings = 0U;
 	bool halted = true;
-	for (target_s *core = target_list; core && halted; core = core->next) {
+	size_t index = 0U;
+	for (target_s *core = target_list; core && halted; core = core->next, ++index) {
 		if (!rp2350_core_is_sibling(target, core))
 			continue;
+		/* Check if the sibling is already stopped - if so, leave it be */
+		target_halt_reason_e reason = target_halt_poll(core, NULL);
+		/* A fatal comms error frees the target list, so bail without touching anything more */
+		if (reason == TARGET_HALT_ERROR)
+			return false;
+		if (reason != TARGET_HALT_RUNNING)
+			continue;
+		/* Request a halt and wait for it */
 		target_halt_request(core);
 		platform_timeout_s timeout;
 		platform_timeout_set(&timeout, 250);
-		target_halt_reason_e reason = TARGET_HALT_RUNNING;
 		while (!platform_timeout_is_expired(&timeout) && reason == TARGET_HALT_RUNNING)
 			reason = target_halt_poll(core, NULL);
-		/* A fatal comms error frees the target list, so bail without touching anything more */
 		if (reason == TARGET_HALT_ERROR)
 			return false;
 		/* Any other non-running reason means the core is stopped, which is all we need */
 		halted = reason != TARGET_HALT_RUNNING;
-		if (!halted)
+		if (halted && index < 32U)
+			rp2350_halted_siblings |= 1U << index;
+		else if (!halted)
 			DEBUG_ERROR("%s: failed to halt sibling core\n", __func__);
 	}
+	/* On a halt failure, release anything we already halted so the system stays usable */
+	if (!halted)
+		rp2350_flash_resume_siblings(target);
 	return halted;
 }
 
 /* Release the sibling cores halted by rp2350_flash_halt_siblings() */
 static void rp2350_flash_resume_siblings(target_s *const target)
 {
-	for (target_s *core = target_list; core; core = core->next) {
-		if (!rp2350_core_is_sibling(target, core))
+	size_t index = 0U;
+	for (target_s *core = target_list; core; core = core->next, ++index) {
+		if (index >= 32U || !(rp2350_halted_siblings & (1U << index)) || !rp2350_core_is_sibling(target, core))
 			continue;
 		target_halt_resume(core, false);
 	}
+	rp2350_halted_siblings = 0U;
 }
 
 static bool rp2350_flash_prepare(target_s *const target)
@@ -259,11 +292,11 @@ static bool rp2350_flash_prepare(target_s *const target)
 
 static bool rp2350_flash_resume(target_s *const target)
 {
-	/* Release the siblings before the reset so the whole chip restarts cleanly */
-	rp2350_flash_resume_siblings(target);
-	/* Reset the target then reconfigure the QMI back to direct access mode */
+	/* Reset the target then reconfigure the QMI back to memory-mapped mode */
 	target_reset(target);
 	rp2350_spi_resume(target);
+	/* With XIP back up, release the siblings so they restart cleanly through the boot ROM */
+	rp2350_flash_resume_siblings(target);
 	return true;
 }
 
