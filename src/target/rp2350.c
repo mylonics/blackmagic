@@ -196,8 +196,62 @@ static bool rp2350_attach(target_s *const target)
 	return true;
 }
 
+/*
+ * The RP2350's cores are exposed as separate targets sharing a single DP (one
+ * AP each). This tells whether another target is a sibling Arm core of the same
+ * chip. Cores booted in RISC-V mode use a different private structure and are
+ * not matched here - halting them is left to a future generic mechanism.
+ */
+static bool rp2350_core_is_sibling(target_s *const target, target_s *const other)
+{
+	if (other == target || target->priv_free != cortex_priv_free || other->priv_free != cortex_priv_free)
+		return false;
+	return cortex_ap(other)->dp == cortex_ap(target)->dp;
+}
+
+/*
+ * A core left running while we reprogram the Flash will crash the moment it next
+ * fetches from XIP. Halt all sibling cores of this chip before touching the
+ * Flash. Mirrors the halt sequence used by cortexm_attach().
+ */
+static bool rp2350_flash_halt_siblings(target_s *const target)
+{
+	bool halted = true;
+	for (target_s *core = target_list; core && halted; core = core->next) {
+		if (!rp2350_core_is_sibling(target, core))
+			continue;
+		target_halt_request(core);
+		platform_timeout_s timeout;
+		platform_timeout_set(&timeout, 250);
+		target_halt_reason_e reason = TARGET_HALT_RUNNING;
+		while (!platform_timeout_is_expired(&timeout) && reason == TARGET_HALT_RUNNING)
+			reason = target_halt_poll(core, NULL);
+		/* A fatal comms error frees the target list, so bail without touching anything more */
+		if (reason == TARGET_HALT_ERROR)
+			return false;
+		/* Any other non-running reason means the core is stopped, which is all we need */
+		halted = reason != TARGET_HALT_RUNNING;
+		if (!halted)
+			DEBUG_ERROR("%s: failed to halt sibling core\n", __func__);
+	}
+	return halted;
+}
+
+/* Release the sibling cores halted by rp2350_flash_halt_siblings() */
+static void rp2350_flash_resume_siblings(target_s *const target)
+{
+	for (target_s *core = target_list; core; core = core->next) {
+		if (!rp2350_core_is_sibling(target, core))
+			continue;
+		target_halt_resume(core, false);
+	}
+}
+
 static bool rp2350_flash_prepare(target_s *const target)
 {
+	/* Halt the sibling core(s) before we take the Flash out of XIP mode they may be executing from */
+	if (!rp2350_flash_halt_siblings(target))
+		return false;
 	/* Configure the QMI over to direct access mode */
 	rp2350_spi_prepare(target);
 	return true;
@@ -205,6 +259,8 @@ static bool rp2350_flash_prepare(target_s *const target)
 
 static bool rp2350_flash_resume(target_s *const target)
 {
+	/* Release the siblings before the reset so the whole chip restarts cleanly */
+	rp2350_flash_resume_siblings(target);
 	/* Reset the target then reconfigure the QMI back to direct access mode */
 	target_reset(target);
 	rp2350_spi_resume(target);

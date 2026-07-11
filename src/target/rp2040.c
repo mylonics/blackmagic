@@ -51,6 +51,7 @@
 #include "target.h"
 #include "target_internal.h"
 #include "cortexm.h"
+#include "cortex_internal.h"
 #include "spi.h"
 #include "sfdp.h"
 
@@ -321,9 +322,79 @@ static void rp_spi_restore(target_s *const target)
 	target_mem32_write32(target, RP_SSI_ENABLE, priv->ssi_enabled);
 }
 
+/*
+ * The RP2040's two Cortex-M0+ cores are exposed as separate targets via SWD
+ * multi-drop, one DP per core, with TARGETSEL values differing only in the
+ * instance ID (bits 31:28). This tells whether another target on the scan is a
+ * sibling core of the same physical chip. The rescue DP pseudo-target is
+ * excluded by the priv_free check as it is not a Cortex target.
+ */
+static bool rp_core_is_sibling(target_s *const target, target_s *const other)
+{
+	if (other == target || other->priv_free != cortex_priv_free)
+		return false;
+	const uint32_t mask = ~ADIV5_DP_TARGETSEL_TINSTANCE_MASK;
+	return (cortex_ap(other)->dp->targetsel & mask) == (cortex_ap(target)->dp->targetsel & mask);
+}
+
+/* Force re-selection of this core's DP on the wire (see cortexm_attach()) */
+static void rp_core_select(target_s *const target)
+{
+	cortex_ap(target)->dp->fault = 1;
+	target_check_error(target);
+}
+
+/*
+ * A core left running while we reprogram the SPI Flash will crash the moment it
+ * next fetches from XIP, taking the Flash write stub down with it. Halt all
+ * sibling cores of this chip before touching the Flash. Mirrors the halt
+ * sequence used by cortexm_attach().
+ */
+static bool rp_flash_halt_siblings(target_s *const target)
+{
+	bool halted = true;
+	for (target_s *core = target_list; core && halted; core = core->next) {
+		if (!rp_core_is_sibling(target, core))
+			continue;
+		/* Select the sibling's DP on the wire, request a halt, and wait for it */
+		rp_core_select(core);
+		target_halt_request(core);
+		platform_timeout_s timeout;
+		platform_timeout_set(&timeout, 250);
+		target_halt_reason_e reason = TARGET_HALT_RUNNING;
+		while (!platform_timeout_is_expired(&timeout) && reason == TARGET_HALT_RUNNING)
+			reason = target_halt_poll(core, NULL);
+		/* A fatal comms error frees the target list, so bail without touching anything more */
+		if (reason == TARGET_HALT_ERROR)
+			return false;
+		/* Any other non-running reason means the core is stopped, which is all we need */
+		halted = reason != TARGET_HALT_RUNNING;
+		if (!halted)
+			DEBUG_ERROR("%s: failed to halt sibling core\n", __func__);
+	}
+	/* Re-select the DP of the core we are flashing through */
+	rp_core_select(target);
+	return halted;
+}
+
+/* Release the sibling cores halted by rp_flash_halt_siblings() */
+static void rp_flash_resume_siblings(target_s *const target)
+{
+	for (target_s *core = target_list; core; core = core->next) {
+		if (!rp_core_is_sibling(target, core))
+			continue;
+		rp_core_select(core);
+		target_halt_resume(core, false);
+	}
+	rp_core_select(target);
+}
+
 static bool rp_flash_prepare(target_s *const target)
 {
 	DEBUG_TARGET("%s\n", __func__);
+	/* Halt the sibling core(s) before we take the Flash out of XIP mode they may be executing from */
+	if (!rp_flash_halt_siblings(target))
+		return false;
 	/* Suspend the cache, come out of XIP */
 	rp_flash_connect_internal(target);
 	rp_flash_exit_xip(target);
@@ -341,6 +412,8 @@ static bool rp_flash_resume(target_s *const target)
 	/* Flush the cache and resume XIP */
 	rp_flash_flush_cache(target);
 	rp_flash_enter_xip(target);
+	/* Release the siblings so the system reset below restarts the whole chip cleanly */
+	rp_flash_resume_siblings(target);
 	target_mem32_write32(target, CORTEXM_AIRCR, CORTEXM_AIRCR_VECTKEY | CORTEXM_AIRCR_SYSRESETREQ);
 	return true;
 }
