@@ -427,8 +427,8 @@ static void exec_q_rcmd(const char *packet, const size_t length)
 	else if (result == 0)
 		gdb_put_packet_ok();
 	else {
-		static const char response[] = "Failed\n";
-		gdb_put_packet_hex(response, ARRAY_LENGTH(response));
+		gdb_out("Failed\n");
+		gdb_put_packet_ok();
 	}
 }
 
