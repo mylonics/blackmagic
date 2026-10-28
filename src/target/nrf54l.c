@@ -51,11 +51,18 @@
 #define NRF54L_UICR 0x00ffd000U
 #define NRF54L_RAM  0x20000000U
 
-#define NRF54L_RRAMC_READY                   0x5004b400U
-#define NRF54L_RRAMC_READYNEXT               0x5004b404U
-#define NRF54L_RRAMC_BUFSTATUS_WRITEBUFEMPTY 0x5004b418U
-#define NRF54L_RRAMC_CONFIG                  0x5004b500U
-#define NRF54L_RRAMC_ERASE_ERASEALL          0x5004b540U
+/*
+ * RRAMC base differs per family (datasheet 4.2.6.7)
+ * Register offsets are the same
+ */
+#define NRF54L05_10_15_RRAMC_BASE 0x5004b000U
+#define NRF54LM20_RRAMC_BASE      0x5004e000U
+
+#define NRF54L_RRAMC_READY                   0x400U
+#define NRF54L_RRAMC_READYNEXT               0x404U
+#define NRF54L_RRAMC_BUFSTATUS_WRITEBUFEMPTY 0x418U
+#define NRF54L_RRAMC_CONFIG                  0x500U
+#define NRF54L_RRAMC_ERASE_ERASEALL          0x540U
 
 #define NRF54L_RRAMC_READY_BUSY                    0U
 #define NRF54L_RRAMC_READYNEXT_READY               1U
@@ -79,13 +86,29 @@
 #define NRF54L_CTRL_AP_APPROTECT_STATUS_APPROTECT_ENABLED       (1U << 0U)
 #define NRF54L_CTRL_AP_APPROTECT_STATUS_SECUREAPPROTECT_ENABLED (1U << 1U)
 
-#define ID_NRF54L 0x1c0U
+/*
+ * Datasheet section 9.1.1.1 is blank for TPARTNO
+ * Lookup of TPARTNO was done on devkits
+ * Parts like the nRF54LC, nRF54LV are likely not supported yet as TPARTNO is unknown
+ */
+#define ID_NRF54L     0x1c0U
+#define ID_NRF54LM20A 0x290U
+#define ID_NRF54LM20B 0x330U
 
 static bool rram_prepare(target_flash_s *flash);
 static bool rram_done(target_flash_s *flash);
 static bool rram_erase(target_flash_s *flash, target_addr_t addr, size_t len);
 static bool rram_write(target_flash_s *flash, target_addr_t dest, const void *src, size_t len);
 static bool rram_mass_erase(target_s *target, platform_timeout_s *print_progess);
+
+typedef struct nrf54l_priv {
+	uint32_t rramc_base;
+} nrf54l_priv_s;
+
+static uint32_t nrf54l_rramc_base(target_s *const target)
+{
+	return ((nrf54l_priv_s *)target->target_storage)->rramc_base;
+}
 
 static void add_rram(target_s *const target, const uint32_t addr, const size_t length, const uint32_t writesize)
 {
@@ -114,17 +137,35 @@ bool nrf54l_probe(target_s *const target)
 	if (ap->dp->version < 2U)
 		return false;
 
+	uint32_t rramc_base;
 	switch (ap->dp->target_partno) {
 	case ID_NRF54L:
 		target->driver = "nRF54L";
-		target->target_options |= TOPT_INHIBIT_NRST;
-		/* On nRF54L SoC, Cortex-M33 allows SRAM access without halting */
-		target->target_options |= TOPT_NON_HALTING_MEM_IO;
+		rramc_base = NRF54L05_10_15_RRAMC_BASE;
+		break;
+	case ID_NRF54LM20A:
+		target->driver = "nRF54LM20A";
+		rramc_base = NRF54LM20_RRAMC_BASE;
+		break;
+	case ID_NRF54LM20B:
+		target->driver = "nRF54LM20B";
+		rramc_base = NRF54LM20_RRAMC_BASE;
 		break;
 	default:
 		return false;
 	}
 
+	nrf54l_priv_s *const priv = calloc(1, sizeof(*priv));
+	if (!priv) {
+		DEBUG_ERROR("calloc: failed in %s\n", __func__);
+		return false;
+	}
+	priv->rramc_base = rramc_base;
+	target->target_storage = priv;
+
+	target->target_options |= TOPT_INHIBIT_NRST;
+	/* On nRF54L SoC, Cortex-M33 allows SRAM access without halting */
+	target->target_options |= TOPT_NON_HALTING_MEM_IO;
 	target->mass_erase = rram_mass_erase;
 
 	const uint32_t info_ram = target_mem32_read32(target, NRF54L_FICR_INFO_RAM);
@@ -140,7 +181,7 @@ bool nrf54l_probe(target_s *const target)
 static bool rram_prepare(target_flash_s *const flash)
 {
 	uint32_t writebufsize = flash->writesize / 16U;
-	target_mem32_write32(flash->t, NRF54L_RRAMC_CONFIG,
+	target_mem32_write32(flash->t, nrf54l_rramc_base(flash->t) + NRF54L_RRAMC_CONFIG,
 		NRF54L_RRAMC_CONFIG_WRITEBUFSIZE(writebufsize) | NRF54L_RRAMC_CONFIG_WRITE_ENABLED);
 	return true;
 }
@@ -148,10 +189,11 @@ static bool rram_prepare(target_flash_s *const flash)
 static bool rram_done(target_flash_s *const flash)
 {
 	// Wait for writebuf to flush.
-	while (target_mem32_read32(flash->t, NRF54L_RRAMC_BUFSTATUS_WRITEBUFEMPTY) !=
+	while (target_mem32_read32(flash->t, nrf54l_rramc_base(flash->t) + NRF54L_RRAMC_BUFSTATUS_WRITEBUFEMPTY) !=
 		NRF54L_RRAMC_BUFSTATUS_WRITEBUFEMPTY_EMPTY)
 		continue;
-	target_mem32_write32(flash->t, NRF54L_RRAMC_CONFIG, NRF54L_RRAMC_CONFIG_WRITE_DISABLED);
+	target_mem32_write32(
+		flash->t, nrf54l_rramc_base(flash->t) + NRF54L_RRAMC_CONFIG, NRF54L_RRAMC_CONFIG_WRITE_DISABLED);
 	return true;
 }
 
@@ -167,7 +209,8 @@ static bool rram_erase(target_flash_s *const flash, const target_addr_t addr, co
 static bool rram_write(target_flash_s *const flash, const target_addr_t dest, const void *const src, const size_t len)
 {
 	// Wait for rram to be ready for next write.
-	while (target_mem32_read32(flash->t, NRF54L_RRAMC_READYNEXT) != NRF54L_RRAMC_READYNEXT_READY)
+	while (target_mem32_read32(flash->t, nrf54l_rramc_base(flash->t) + NRF54L_RRAMC_READYNEXT) !=
+		NRF54L_RRAMC_READYNEXT_READY)
 		continue;
 	target_mem32_write(flash->t, dest, src, len);
 	return true;
@@ -175,9 +218,10 @@ static bool rram_write(target_flash_s *const flash, const target_addr_t dest, co
 
 static bool rram_mass_erase(target_s *const target, platform_timeout_s *const print_progess)
 {
-	target_mem32_write32(target, NRF54L_RRAMC_ERASE_ERASEALL, NRF54L_RRAMC_ERASE_ERASEALL_ERASE);
+	target_mem32_write32(
+		target, nrf54l_rramc_base(target) + NRF54L_RRAMC_ERASE_ERASEALL, NRF54L_RRAMC_ERASE_ERASEALL_ERASE);
 
-	while (target_mem32_read32(target, NRF54L_RRAMC_READY) == NRF54L_RRAMC_READY_BUSY)
+	while (target_mem32_read32(target, nrf54l_rramc_base(target) + NRF54L_RRAMC_READY) == NRF54L_RRAMC_READY_BUSY)
 		target_print_progress(print_progess);
 
 	return true;
