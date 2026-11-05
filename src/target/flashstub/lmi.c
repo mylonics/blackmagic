@@ -49,5 +49,5 @@ void __attribute__((naked)) stm32f1_flash_write_stub(
 			continue;
 	}
 
-	stub_exit(0);
+	stub_exit(1);
 }

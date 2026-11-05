@@ -65,5 +65,5 @@ void __attribute__((naked)) efm32_flash_write_stub(
 			continue;
 	}
 
-	stub_exit(0);
+	stub_exit(1);
 }

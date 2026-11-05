@@ -634,8 +634,7 @@ static bool efm32_flash_write(target_flash_s *flash, target_addr_t dest, const v
 	/* Write Buffer */
 	target_mem32_write(target, STUB_BUFFER_BASE, src, len);
 	/* Run flashloader */
-	const bool ret =
-		cortexm_run_stub(target, SRAM_BASE, dest, STUB_BUFFER_BASE, len, priv_storage->device->msc_addr) == 0;
+	const bool ret = cortexm_run_stub(target, SRAM_BASE, dest, STUB_BUFFER_BASE, len, priv_storage->device->msc_addr);
 
 #if ENABLE_DEBUG == 1
 	/* Check the MSC_IF */
