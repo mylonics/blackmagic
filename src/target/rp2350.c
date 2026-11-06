@@ -38,6 +38,7 @@
 #include "cortexm.h"
 #include "cortex_internal.h"
 #include "riscv_debug.h"
+#include "rp_siblings.h"
 #include "spi.h"
 #include "sfdp.h"
 
@@ -126,7 +127,18 @@
 #define ID_RP2350_ARM   0x0040U
 #define ID_RP2350_RISCV 0x0004U
 
+typedef struct rp2350_priv {
+	/* The other Arm core, held halted while the Flash is unavailable */
+	rp_siblings_s siblings;
+	/* Set from taking the QMI into direct mode for Flash operations until rp2350_flash_resume() undoes it */
+	bool xip_suspended;
+} rp2350_priv_s;
+
 static bool rp2350_attach(target_s *target);
+static void rp2350_attach_abort(target_s *target, bool xip_down);
+static void rp2350_detach(target_s *target);
+static bool rp2350_core_is_sibling(target_s *target, target_s *other);
+static void rp2350_flash_abandon(target_s *target);
 static bool rp2350_flash_prepare(target_s *target);
 static bool rp2350_flash_resume(target_s *target);
 
@@ -169,8 +181,18 @@ bool rp2350_probe(target_s *const target)
 	}
 	DEBUG_TARGET("Boot ROM version: %x\n", (uint8_t)(boot_magic >> RP2350_BOOTROM_VERSION_SHIFT));
 
+	rp2350_priv_s *const priv = calloc(1, sizeof(*priv));
+	if (!priv) { /* calloc failed: heap exhaustion */
+		DEBUG_ERROR("calloc: failed in %s\n", __func__);
+		return false;
+	}
+	target->target_storage = priv;
+
 	target->driver = "RP2350";
 	target->attach = rp2350_attach;
+	/* Only Arm cores halt their sibling, so only they have one to put back on detach */
+	if (target->priv_free == cortex_priv_free)
+		target->detach = rp2350_detach;
 	target->enter_flash_mode = rp2350_flash_prepare;
 	target->exit_flash_mode = rp2350_flash_resume;
 	return true;
@@ -189,15 +211,102 @@ static bool rp2350_attach(target_s *const target)
 #endif
 	}
 
-	/* Then figure out the memory map */
-	target_mem_map_free(target);
-	target_add_ram32(target, RP2350_SRAM_BASE, RP2350_SRAM_SIZE);
-	rp2350_add_flash(target);
+	rp2350_priv_s *const priv = (rp2350_priv_s *)target->target_storage;
+	/* Set while probing the Flash may have XIP down */
+	volatile bool xip_down = false;
+	TRY (EXCEPTION_ALL) {
+		/* Probing the Flash takes XIP away, so stop the other core executing from it meanwhile */
+		rp_siblings_halt(target, &priv->siblings, rp2350_core_is_sibling);
+		/* Then figure out the memory map */
+		target_mem_map_free(target);
+		target_add_ram32(target, RP2350_SRAM_BASE, RP2350_SRAM_SIZE);
+		xip_down = true;
+		rp2350_add_flash(target);
+		xip_down = false;
+		/* XIP is back as it was, so let the other core carry on from where it stopped */
+		rp_siblings_release(target, &priv->siblings, false);
+	}
+	CATCH () {
+	default:
+		rp2350_attach_abort(target, xip_down);
+		raise_exception(exception_frame.type, exception_frame.msg);
+	}
 	return true;
+}
+
+/*
+ * Attach failed with the other core halted, possibly part way through probing the Flash: put XIP back if it may be
+ * down, then let the other core carry on. This is best-effort, as the chip may no longer be reachable.
+ */
+static void rp2350_attach_abort(target_s *const target, const bool xip_down)
+{
+	rp2350_priv_s *const priv = (rp2350_priv_s *)target->target_storage;
+	TRY (EXCEPTION_ALL) {
+		if (xip_down) {
+			/* End any transfer in flight, draining the FIFOs and releasing the chip selects, then leave direct mode */
+			rp2350_spi_prepare(target);
+			rp2350_spi_resume(target);
+		}
+		rp_siblings_release(target, &priv->siblings, false);
+	}
+	CATCH () {
+	default:
+		rp2350_flash_abandon(target);
+	}
+}
+
+/*
+ * Detaching, which also happens when the target list is freed after a comms failure, with the QMI still in direct
+ * mode or the other core still halted: put everything back as leaving Flash mode would, then detach as usual.
+ */
+static void rp2350_detach(target_s *const target)
+{
+	rp2350_priv_s *const priv = (rp2350_priv_s *)target->target_storage;
+	TRY (EXCEPTION_ALL) {
+		if (priv->xip_suspended) {
+			/* End any transfer in flight, draining the FIFOs and releasing the chip selects */
+			rp2350_spi_prepare(target);
+			rp2350_flash_resume(target);
+		} else
+			rp_siblings_release(target, &priv->siblings, false);
+	}
+	CATCH () {
+	default:
+		rp2350_flash_abandon(target);
+	}
+	cortexm_detach(target);
+}
+
+/*
+ * The chip could not be put back in order. Leave the other core halted rather than let it run into a missing XIP,
+ * and tell the user, as only a reset of the target recovers from this.
+ */
+static void rp2350_flash_abandon(target_s *const target)
+{
+	rp2350_priv_s *const priv = (rp2350_priv_s *)target->target_storage;
+	rp_siblings_report(target, "could not restore the Flash or the other core, reset the target to recover");
+	rp_siblings_forget(&priv->siblings);
+	priv->xip_suspended = false;
+}
+
+/*
+ * The RP2350's Arm cores share a single DP, with an AP each. Cores booted as RISC-V harts use a different private
+ * structure and are not matched: halting those is left to a future generic mechanism.
+ */
+static bool rp2350_core_is_sibling(target_s *const target, target_s *const other)
+{
+	if (other == target || target->priv_free != cortex_priv_free || other->priv_free != cortex_priv_free)
+		return false;
+	return cortex_ap(other)->dp == cortex_ap(target)->dp;
 }
 
 static bool rp2350_flash_prepare(target_s *const target)
 {
+	rp2350_priv_s *const priv = (rp2350_priv_s *)target->target_storage;
+	/* Halt the other core first, as it may be executing from the XIP about to be taken away */
+	rp_siblings_halt(target, &priv->siblings, rp2350_core_is_sibling);
+	/* From here on, rp2350_flash_resume() puts everything back, run from rp2350_detach() should anything fail */
+	priv->xip_suspended = true;
 	/* Configure the QMI over to direct access mode */
 	rp2350_spi_prepare(target);
 	return true;
@@ -205,9 +314,19 @@ static bool rp2350_flash_prepare(target_s *const target)
 
 static bool rp2350_flash_resume(target_s *const target)
 {
-	/* Reset the target then reconfigure the QMI back to direct access mode */
+	rp2350_priv_s *const priv = (rp2350_priv_s *)target->target_storage;
+	/* Detaching in Flash mode already put everything back */
+	if (!priv->xip_suspended)
+		return true;
+	/* Reset the target then reconfigure the QMI back to memory-mapped mode */
 	target_reset(target);
 	rp2350_spi_resume(target);
+	/*
+	 * With XIP back, restart the other core so it does not carry on in the old Flash contents. This skips the
+	 * reset if the one above already reset it (rp_core_restart() checks), which depends on how the reset was done.
+	 */
+	rp_siblings_release(target, &priv->siblings, true);
+	priv->xip_suspended = false;
 	return true;
 }
 

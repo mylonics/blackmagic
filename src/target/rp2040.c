@@ -51,6 +51,8 @@
 #include "target.h"
 #include "target_internal.h"
 #include "cortexm.h"
+#include "cortex_internal.h"
+#include "rp_siblings.h"
 #include "spi.h"
 #include "sfdp.h"
 
@@ -159,6 +161,18 @@
 #define RP_BOOTROM_FUNC_TABLE_ADDR      0x00000014U
 #define RP_BOOTROM_FUNC_TABLE_TAG(x, y) ((uint8_t)(x) | ((uint8_t)(y) << 8U))
 
+/* SYSCFG routes IRQs onto a core's NMI, with one mask register per core */
+#define RP_SYSCFG_BASE_ADDR           0x40004000U
+#define RP_SYSCFG_PROC_NMI_MASK(core) (RP_SYSCFG_BASE_ADDR + ((core) * 4U))
+
+/* Cortex-M0+ System Control Space registers used to keep a core from taking exceptions during stub runs */
+#define RP_SYST_CSR         0xe000e010U
+#define RP_SYST_CSR_TICKINT (1U << 1U)
+#define RP_NVIC_ICER        0xe000e180U
+#define RP_NVIC_ICPR        0xe000e280U
+#define RP_ICSR_PENDSVCLR   (1U << 27U)
+#define RP_ICSR_PENDSTCLR   (1U << 25U)
+
 #define RP2040_MAX_FLASH (16U * 1024U * 1024U)
 
 #define ID_RP2040 0x1002U
@@ -169,6 +183,10 @@ typedef struct rp_priv {
 	uint32_t ctrl0;
 	uint32_t ctrl1;
 	uint32_t xpi_ctrl0;
+	/* The other core, held halted while the Flash is unavailable */
+	rp_siblings_s siblings;
+	/* Set from taking XIP down for Flash operations until rp_flash_resume() puts everything back */
+	bool xip_suspended;
 } rp_priv_s;
 
 static bool rp_cmd_erase_sector(target_s *target, int argc, const char **argv);
@@ -186,6 +204,11 @@ static const uint16_t rp_flash_write_stub[] = {
 
 static bool rp_read_rom_func_table(target_s *target);
 static bool rp_attach(target_s *target);
+static void rp_attach_abort(target_s *target, bool xip_down);
+static void rp_detach(target_s *target);
+static bool rp_core_is_sibling(target_s *target, target_s *other);
+static void rp_flash_abandon(target_s *target);
+static void rp_flash_quiesce_exceptions(target_s *target);
 static void rp_spi_config(target_s *target);
 static void rp_spi_restore(target_s *target);
 static bool rp_flash_prepare(target_s *target);
@@ -249,6 +272,7 @@ bool rp2040_probe(target_s *const target)
 	target->driver = "RP2040";
 	target->target_options |= TOPT_INHIBIT_NRST;
 	target->attach = rp_attach;
+	target->detach = rp_detach;
 	target->enter_flash_mode = rp_flash_prepare;
 	target->exit_flash_mode = rp_flash_resume;
 	target_add_commands(target, rp_cmd_list, target->driver);
@@ -260,13 +284,93 @@ static bool rp_attach(target_s *const target)
 	if (!cortexm_attach(target) || !rp_read_rom_func_table(target))
 		return false;
 
-	/* Free previously loaded memory map */
-	target_mem_map_free(target);
-	rp_add_flash(target);
-	target_add_ram32(target, RP_SRAM_BASE, RP_SRAM_SIZE);
-	target_add_rom32(target, RP_BOOTROM_BASE, RP_BOOTROM_SIZE);
-
+	rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
+	/* Set while probing the Flash may have XIP down */
+	volatile bool xip_down = false;
+	TRY (EXCEPTION_ALL) {
+		/* Probing the Flash takes XIP away, so stop the other core executing from it meanwhile */
+		rp_siblings_halt(target, &priv->siblings, rp_core_is_sibling);
+		/* Free previously loaded memory map */
+		target_mem_map_free(target);
+		xip_down = true;
+		rp_add_flash(target);
+		xip_down = false;
+		target_add_ram32(target, RP_SRAM_BASE, RP_SRAM_SIZE);
+		target_add_rom32(target, RP_BOOTROM_BASE, RP_BOOTROM_SIZE);
+		/* XIP is back as it was, so let the other core carry on from where it stopped */
+		rp_siblings_release(target, &priv->siblings, false);
+	}
+	CATCH () {
+	default:
+		rp_attach_abort(target, xip_down);
+		raise_exception(exception_frame.type, exception_frame.msg);
+	}
 	return true;
+}
+
+/*
+ * Attach failed with the other core halted, possibly part way through probing the Flash: put XIP back if it may be
+ * down, then let the other core carry on. This is best-effort, as the chip may no longer be reachable.
+ */
+static void rp_attach_abort(target_s *const target, const bool xip_down)
+{
+	rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
+	TRY (EXCEPTION_ALL) {
+		if (xip_down) {
+			/* Stop driving the Flash chip select by hand, and go back to XIP */
+			rp_flash_flush_cache(target);
+			rp_flash_enter_xip(target);
+		}
+		rp_siblings_release(target, &priv->siblings, false);
+	}
+	CATCH () {
+	default:
+		rp_flash_abandon(target);
+	}
+}
+
+/*
+ * Detaching, which also happens when the target list is freed after a comms failure, with XIP still down or the
+ * other core still halted: put everything back as leaving Flash mode would, then detach as usual.
+ */
+static void rp_detach(target_s *const target)
+{
+	rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
+	TRY (EXCEPTION_ALL) {
+		if (priv->xip_suspended)
+			rp_flash_resume(target);
+		else
+			rp_siblings_release(target, &priv->siblings, false);
+	}
+	CATCH () {
+	default:
+		rp_flash_abandon(target);
+	}
+	cortexm_detach(target);
+}
+
+/*
+ * The chip could not be put back in order. Leave the other core halted rather than let it run into a missing XIP,
+ * and tell the user, as only a reset of the target recovers from this.
+ */
+static void rp_flash_abandon(target_s *const target)
+{
+	rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
+	rp_siblings_report(target, "could not restore the Flash or the other core, reset the target to recover");
+	rp_siblings_forget(&priv->siblings);
+	priv->xip_suspended = false;
+}
+
+/*
+ * The RP2040's two cores sit behind separate multi-drop DPs whose TARGETSEL values differ only in the instance
+ * field. The rescue DP pseudo-target is not a Cortex-M target, and so is excluded by the priv_free check.
+ */
+static bool rp_core_is_sibling(target_s *const target, target_s *const other)
+{
+	if (other == target || other->priv_free != cortex_priv_free)
+		return false;
+	const uint32_t mask = ~ADIV5_DP_TARGETSEL_TINSTANCE_MASK;
+	return (cortex_ap(other)->dp->targetsel & mask) == (cortex_ap(target)->dp->targetsel & mask);
 }
 
 /*
@@ -324,27 +428,69 @@ static void rp_spi_restore(target_s *const target)
 	target_mem32_write32(target, RP_SSI_ENABLE, priv->ssi_enabled);
 }
 
+/*
+ * The Flash write stub runs on this core with XIP, and so the vector table, gone, which makes any exception taken
+ * during a stub run fatal. cortexm_run_stub() runs it with PRIMASK clear, so knock out every exception source:
+ * SysTick, PendSV, all NVIC lines, and anything SYSCFG routes onto this core's NMI. Nothing is put back, as leaving
+ * Flash mode resets this core: the firmware it then boots expects, or sets up for itself, the power-on values of all
+ * of these. That includes the NMI mask, which a core reset leaves alone, so restoring the old firmware's routing
+ * could deliver NMIs to new firmware that does not expect them.
+ */
+static void rp_flash_quiesce_exceptions(target_s *const target)
+{
+	const uint32_t syst_csr = target_mem32_read32(target, RP_SYST_CSR);
+	target_mem32_write32(target, RP_SYST_CSR, syst_csr & ~RP_SYST_CSR_TICKINT);
+	target_mem32_write32(target, CORTEXM_ICSR, RP_ICSR_PENDSVCLR | RP_ICSR_PENDSTCLR);
+	target_mem32_write32(target, RP_NVIC_ICER, 0xffffffffU);
+	target_mem32_write32(target, RP_NVIC_ICPR, 0xffffffffU);
+	/* The core number is the DP's instance number */
+	const uint32_t core =
+		(cortex_ap(target)->dp->targetsel & ADIV5_DP_TARGETSEL_TINSTANCE_MASK) >> ADIV5_DP_TARGETSEL_TINSTANCE_OFFSET;
+	target_mem32_write32(target, RP_SYSCFG_PROC_NMI_MASK(core), 0U);
+}
+
 static bool rp_flash_prepare(target_s *const target)
 {
 	DEBUG_TARGET("%s\n", __func__);
+	rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
+	/* Halt the other core first, as it may be executing from the XIP about to be taken away */
+	rp_siblings_halt(target, &priv->siblings, rp_core_is_sibling);
+	/* From here on, rp_flash_resume() puts everything back, run from rp_detach() should anything fail */
+	priv->xip_suspended = true;
+	/* Keep this core from taking exceptions while it runs the write stub */
+	rp_flash_quiesce_exceptions(target);
 	/* Suspend the cache, come out of XIP */
 	rp_flash_connect_internal(target);
 	rp_flash_exit_xip(target);
 	/* Configure the SPI controller for our use */
 	rp_spi_config(target);
 	/* Preload the SPI Flash write stub */
-	return target_mem32_write(target, RP_SRAM_BASE, rp_flash_write_stub, sizeof(rp_flash_write_stub)) == 0;
+	if (target_mem32_write(target, RP_SRAM_BASE, rp_flash_write_stub, sizeof(rp_flash_write_stub)) == 0)
+		return true;
+	/* Nothing can be written without the stub, so put everything back as leaving Flash mode would */
+	rp_flash_resume(target);
+	return false;
 }
 
 static bool rp_flash_resume(target_s *const target)
 {
 	DEBUG_TARGET("%s\n", __func__);
+	rp_priv_s *const priv = (rp_priv_s *)target->target_storage;
+	/* Detaching in Flash mode already put everything back */
+	if (!priv->xip_suspended)
+		return true;
 	/* Put the SPI controller back how it was when we entered Flash mode */
 	rp_spi_restore(target);
 	/* Flush the cache and resume XIP */
 	rp_flash_flush_cache(target);
 	rp_flash_enter_xip(target);
-	target_mem32_write32(target, CORTEXM_AIRCR, CORTEXM_AIRCR_VECTKEY | CORTEXM_AIRCR_SYSRESETREQ);
+	/*
+	 * Reset this core so that it boots the new Flash contents. On RP2040 that does not reset the other core
+	 * (datasheet section 2.4.2.9), so restart that separately rather than let it carry on in the old contents.
+	 */
+	target_reset(target);
+	rp_siblings_release(target, &priv->siblings, true);
+	priv->xip_suspended = false;
 	return true;
 }
 
@@ -659,9 +805,10 @@ static bool rp_cmd_erase_sector(target_s *const target, const int argc, const ch
 
 	target_flash_s *const flash = target->flash;
 
-	bool result = true; /* catch false returns with &= */
-	result &= rp_flash_prepare(target);
-	result &= flash->erase(flash, start, length);
+	/* A failed prepare has already put everything back, and erasing with XIP up would be wrong */
+	if (!rp_flash_prepare(target))
+		return false;
+	bool result = flash->erase(flash, start, length);
 	result &= rp_flash_resume(target);
 	return result;
 }
