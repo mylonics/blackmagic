@@ -23,7 +23,9 @@
 #include "target.h"
 #include "adiv5.h"
 
+#ifndef STRINGIFY
 #define STRINGIFY(x) #x
+#endif
 /* Probe launch macro used by the CPU-generic layers to then call CPU-specific routines safely */
 #define PROBE(x)                                    \
 	do {                                            \
