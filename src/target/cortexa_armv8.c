@@ -1299,8 +1299,8 @@ static inline void cortexa_armv8_mem_restore_regs(target_s *const target, const 
 
 	/* In case of fault and if the data saved are valid, we restore appropriate system values */
 	if (!cortexa_armv8_check_itr_err(target) && priv->core_status & CORTEXA_CORE_STATUS_FAULT_CACHE_VALID) {
-		cortexa_armv8_priv_fault_state_s tmp;
 #ifndef DEBUG_WARN_IS_NOOP
+		cortexa_armv8_priv_fault_state_s tmp;
 		cortexa_armv8_mem_read_fault_state(target, &tmp);
 		DEBUG_WARN("%s: Failed at 0x%08" PRIx64 " (%08" PRIx64 ")\n", func, tmp.address, tmp.status);
 #else
